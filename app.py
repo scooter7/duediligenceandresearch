@@ -12,20 +12,21 @@ from tools import generate_html_report, generate_infographic, generate_financial
 st.set_page_config(page_title="Investment Intelligence 2026", layout="wide")
 Path("outputs").mkdir(exist_ok=True)
 
-# Initialize Session State
+# Initialize Session State variables
 for k in ["plan_id", "tasks", "research_text", "final_memo", "auth"]:
     if k not in st.session_state: st.session_state[k] = None
 
 # Auth Layer
 if not st.session_state.auth:
     pw = st.text_input("Application Password", type="password")
-    if st.button("Login"):
+    if st.button("Unlock"):
         if pw == st.secrets.get("APP_PASSWORD", "admin123"):
             st.session_state.auth = True
             st.rerun()
     st.stop()
 
 with st.sidebar:
+    st.header("⚙️ Settings")
     api_key = st.secrets.get("GOOGLE_API_KEY") or st.text_input("Gemini API Key", type="password")
     if st.button("Reset Everything"):
         st.session_state.clear()
@@ -37,7 +38,9 @@ if not api_key: st.info("Enter API Key in Sidebar."); st.stop()
 client = genai.Client(api_key=api_key)
 
 def get_text(outputs): return "\n".join(o.text for o in (outputs or []) if hasattr(o, 'text'))
-def parse_tasks(text): return [{"num": m.group(1), "text": m.group(2).strip()} for m in re.finditer(r'^(\d+)[\.\)\-]\s*(.+?)(?=\n\d+[\.\)\-]|\n\n|\Z)', text, re.MULTILINE | re.DOTALL)]
+def parse_tasks(text): 
+    return [{"num": m.group(1), "text": m.group(2).strip()} 
+            for m in re.finditer(r'^(\d+)[\.\)\-]\s*(.+?)(?=\n\d+[\.\)\-]|\n\n|\Z)', text, re.MULTILINE | re.DOTALL)]
 
 # --- STEP 1: PLANNING ---
 target = st.text_input("Analysis Target", placeholder="e.g., Pet cremation in Phoenix, AZ")
@@ -55,8 +58,11 @@ if st.session_state.tasks:
     st.divider()
     st.subheader("🔍 Investigation Phase")
     selected_tasks = []
-    for t in st.session_state.tasks:
-        if st.checkbox(f"Task {t['num']}: {t['text']}", value=True, key=f"check_{t['num']}"):
+    
+    # FIX: Use a combined index + task number to guarantee unique keys
+    for idx, t in enumerate(st.session_state.tasks):
+        unique_key = f"check_{t['num']}_{idx}"
+        if st.checkbox(f"Task {t['num']}: {t['text']}", value=True, key=unique_key):
             selected_tasks.append(f"{t['num']}. {t['text']}")
     
     if st.button("🚀 Step 2: Start Deep Research"):
@@ -84,10 +90,10 @@ if st.session_state.research_text:
     if st.button("📊 Step 3: Run Analysis Team"):
         with st.spinner("Orchestrating specialized agents..."):
             try:
-                # 1. Setup Session Service for the Runner
+                # Initialize Session Service for the Runner
                 session_service = InMemorySessionService()
 
-                # 2. Setup Pipeline Agents
+                # Setup Pipeline Agents
                 fin = LlmAgent(name="Fin", model="gemini-3-pro-preview", 
                                instruction=f"Data: {st.session_state.research_text}", tools=[generate_financial_chart])
                 partner = LlmAgent(name="Partner", model="gemini-3-pro-preview", 
@@ -95,9 +101,8 @@ if st.session_state.research_text:
                 
                 pipeline = SequentialAgent(name="AnalysisPipeline", sub_agents=[fin, partner])
 
-                # 3. Official Runner Pattern with session_service
+                # Official Runner Pattern with session_service
                 async def run_pipeline():
-                    # Runner requires agent and session_service
                     runner = Runner(
                         agent=pipeline, 
                         session_service=session_service,
@@ -108,7 +113,6 @@ if st.session_state.research_text:
                     input_content = types.Content(role='user', parts=[types.Part(text="Finalize Report")])
                     
                     final_text = "Analysis failed."
-                    # Run asynchronously and iterate through events
                     async for event in runner.run_async(
                         user_id="streamlit_user", 
                         session_id="session_01", 
