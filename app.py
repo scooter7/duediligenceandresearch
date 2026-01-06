@@ -17,13 +17,12 @@ st.set_page_config(page_title="Investment Intelligence 2026", layout="wide")
 Path("outputs").mkdir(exist_ok=True)
 
 # Initialize Session State variables
-for k in ["plan_id", "tasks", "research_text", "final_memo", "auth", "adk_session_id"]:
+for k in ["plan_id", "tasks", "research_text", "final_memo", "auth", "adk_session_id", "step2_debug"]:
     if k not in st.session_state:
         st.session_state[k] = None
 
 # Create a stable session id for this Streamlit user session
 if not st.session_state.adk_session_id:
-    # Simple stable id within a Streamlit browser session:
     st.session_state.adk_session_id = "session_01"
 
 # Auth Layer
@@ -54,9 +53,6 @@ os.environ["GOOGLE_API_KEY"] = api_key
 # Gemini client for Steps 1-2
 client = genai.Client(api_key=api_key)
 
-def get_text(outputs):
-    return "\n".join(o.text for o in (outputs or []) if hasattr(o, "text"))
-
 def parse_tasks(text):
     return [
         {"num": m.group(1), "text": m.group(2).strip()}
@@ -66,6 +62,58 @@ def parse_tasks(text):
             re.MULTILINE | re.DOTALL,
         )
     ]
+
+def extract_text_any(obj) -> str:
+    """
+    Robustly pull text out of various Google GenAI/ADK output shapes.
+    Handles:
+      - obj.text
+      - obj.parts[].text
+      - obj.content.parts[].text
+      - strings
+      - lists/tuples of any of the above
+    """
+    if obj is None:
+        return ""
+
+    # Direct string
+    if isinstance(obj, str):
+        return obj
+
+    # List / tuple -> join
+    if isinstance(obj, (list, tuple)):
+        return "\n".join([t for t in (extract_text_any(x) for x in obj) if t]).strip()
+
+    chunks = []
+
+    # Common: obj.text
+    t = getattr(obj, "text", None)
+    if isinstance(t, str) and t.strip():
+        chunks.append(t.strip())
+
+    # Common: obj.parts (list of Part-like)
+    parts = getattr(obj, "parts", None)
+    if isinstance(parts, (list, tuple)):
+        for p in parts:
+            pt = getattr(p, "text", None)
+            if isinstance(pt, str) and pt.strip():
+                chunks.append(pt.strip())
+
+    # Common: obj.content.parts
+    content = getattr(obj, "content", None)
+    if content is not None:
+        cparts = getattr(content, "parts", None)
+        if isinstance(cparts, (list, tuple)):
+            for p in cparts:
+                pt = getattr(p, "text", None)
+                if isinstance(pt, str) and pt.strip():
+                    chunks.append(pt.strip())
+
+    return "\n".join(chunks).strip()
+
+def get_text(outputs) -> str:
+    # outputs is usually a list of output objects; extract robustly
+    return extract_text_any(outputs)
 
 # Persist session service across Streamlit reruns (best practice for ADK in Streamlit)
 @st.cache_resource
@@ -111,16 +159,42 @@ if st.session_state.tasks:
                 )
 
                 # Poll for completion
+                last_status = None
                 while True:
                     interaction = client.interactions.get(i.id)
-                    if interaction.status != "in_progress":
+                    last_status = getattr(interaction, "status", None)
+                    if last_status != "in_progress":
                         break
                     time.sleep(5)
 
-                st.session_state.research_text = get_text(interaction.outputs)
+                # Save debug info no matter what (helps if output is empty)
+                st.session_state.step2_debug = {
+                    "interaction_id": getattr(interaction, "id", None),
+                    "status": last_status,
+                    "has_outputs": bool(getattr(interaction, "outputs", None)),
+                    "outputs_type": str(type(getattr(interaction, "outputs", None))),
+                    "raw_outputs_repr": repr(getattr(interaction, "outputs", None))[:4000],  # cap
+                }
+
+                text = get_text(getattr(interaction, "outputs", None))
+
+                if not text.strip():
+                    # If the run completed but we got no parseable text, show a useful warning
+                    st.warning(
+                        "Deep Research completed, but no text was extracted from outputs. "
+                        "Open the debug expander below to see the raw outputs structure."
+                    )
+
+                st.session_state.research_text = text
                 st.rerun()
+
             except Exception as e:
                 st.error(f"Error: {e}")
+
+# Show Step 2 debug info if present
+if st.session_state.step2_debug:
+    with st.expander("🛠 Step 2 Debug (click if results look empty)"):
+        st.json(st.session_state.step2_debug)
 
 # --- STEP 3: ANALYSIS TEAM (RENDERED PERSISTENTLY) ---
 if st.session_state.research_text:
@@ -133,13 +207,16 @@ if st.session_state.research_text:
             try:
                 session_service = get_session_service()
 
-                # Setup Pipeline Agents
                 fin = LlmAgent(
                     name="Fin",
                     model="gemini-3-pro-preview",
-                    instruction=f"Use this research data to produce financial projections and charts where helpful.\n\nDATA:\n{st.session_state.research_text}",
+                    instruction=(
+                        "Use this research data to produce financial projections and charts where helpful.\n\n"
+                        f"DATA:\n{st.session_state.research_text}"
+                    ),
                     tools=[generate_financial_chart],
                 )
+
                 partner = LlmAgent(
                     name="Partner",
                     model="gemini-3-pro-preview",
@@ -162,7 +239,7 @@ if st.session_state.research_text:
                     user_id = "streamlit_user"
                     session_id = st.session_state.adk_session_id
 
-                    # ✅ BEST FIX: explicitly create session (InMemorySessionService does not auto-create)
+                    # ✅ Explicitly create the session (prevents Session not found)
                     await session_service.create_session(
                         app_name="investment_intel_2026",
                         user_id=user_id,
@@ -181,12 +258,10 @@ if st.session_state.research_text:
                         new_message=input_content,
                     ):
                         if event.is_final_response():
-                            # Defensive: some final responses may have multiple parts
                             parts = getattr(event.content, "parts", []) or []
                             final_text = "\n".join(
                                 p.text for p in parts if hasattr(p, "text") and p.text
                             ) or final_text
-
                     return final_text
 
                 st.session_state.final_memo = asyncio.run(run_pipeline())
