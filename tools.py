@@ -22,9 +22,9 @@ async def generate_financial_chart(company_name, current_arr, bear_rates, base_r
 
         fig, ax = plt.subplots(figsize=(10, 6))
         ax.plot(years, project(current_arr, bear), 'o-', label='Bear')
-        ax.plot(years, project(current_arr, base), 's-', label='Base')
+        ax.plot(years, project(current_arr, base), 's-', label='Base', linewidth=2)
         ax.plot(years, project(current_arr, bull), '^-', label='Bull')
-        ax.set_title(f'{company_name} Analysis')
+        ax.set_title(f'{company_name} Revenue Projections')
         plt.legend()
         
         buf = io.BytesIO()
@@ -43,7 +43,7 @@ async def generate_financial_chart(company_name, current_arr, bear_rates, base_r
 async def generate_html_report(report_data, tool_context: ToolContext):
     try:
         client = Client()
-        prompt = f"Format this into McKinsey-style HTML: {report_data}"
+        prompt = f"Format this memo into professional HTML: {report_data}"
         response = await client.aio.models.generate_content(model="gemini-3-flash-preview", contents=prompt)
         html = response.text.replace("```html", "").replace("```", "").strip()
         fname = f"memo_{datetime.now().strftime('%H%M%S')}.html"
