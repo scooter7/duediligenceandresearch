@@ -7,10 +7,8 @@ from datetime import datetime
 from google.adk.tools import ToolContext
 from google.genai import types, Client
 
-# Set non-interactive backend for headless Streamlit
 matplotlib.use('Agg')
 logger = logging.getLogger("InvestmentTools")
-
 OUTPUTS_DIR = Path("outputs")
 OUTPUTS_DIR.mkdir(exist_ok=True)
 
