@@ -4,6 +4,8 @@ from pathlib import Path
 from google import genai
 from google.adk.agents import LlmAgent, SequentialAgent
 from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
 from tools import generate_html_report, generate_infographic, generate_financial_chart
 
 # --- 1. SYSTEM SETUP ---
@@ -53,7 +55,6 @@ if st.session_state.tasks:
     st.divider()
     st.subheader("🔍 Investigation Phase")
     selected_tasks = []
-    # UNIQUE KEYS: Ensure keys are only generated once per rerun cycle
     for t in st.session_state.tasks:
         if st.checkbox(f"Task {t['num']}: {t['text']}", value=True, key=f"check_{t['num']}"):
             selected_tasks.append(f"{t['num']}. {t['text']}")
@@ -83,7 +84,10 @@ if st.session_state.research_text:
     if st.button("📊 Step 3: Run Analysis Team"):
         with st.spinner("Orchestrating specialized agents..."):
             try:
-                # Setup Pipeline Agents
+                # 1. Setup Session Service for the Runner
+                session_service = InMemorySessionService()
+
+                # 2. Setup Pipeline Agents
                 fin = LlmAgent(name="Fin", model="gemini-3-pro-preview", 
                                instruction=f"Data: {st.session_state.research_text}", tools=[generate_financial_chart])
                 partner = LlmAgent(name="Partner", model="gemini-3-pro-preview", 
@@ -91,14 +95,28 @@ if st.session_state.research_text:
                 
                 pipeline = SequentialAgent(name="AnalysisPipeline", sub_agents=[fin, partner])
 
-                # Official Runner Pattern for 2026 ADK
+                # 3. Official Runner Pattern with session_service
                 async def run_pipeline():
-                    runner = Runner(agent=pipeline)
-                    events = []
-                    async for event in runner.run_async(input="Finalize Report"):
-                        events.append(event)
-                    # Extract content from final response event
-                    return events[-1].content.parts[0].text if events else "Analysis failed."
+                    # Runner requires agent and session_service
+                    runner = Runner(
+                        agent=pipeline, 
+                        session_service=session_service,
+                        app_name="investment_intel_2026"
+                    )
+                    
+                    # Prepare input as types.Content
+                    input_content = types.Content(role='user', parts=[types.Part(text="Finalize Report")])
+                    
+                    final_text = "Analysis failed."
+                    # Run asynchronously and iterate through events
+                    async for event in runner.run_async(
+                        user_id="streamlit_user", 
+                        session_id="session_01", 
+                        new_message=input_content
+                    ):
+                        if event.is_final_response():
+                            final_text = event.content.parts[0].text
+                    return final_text
 
                 st.session_state.final_memo = asyncio.run(run_pipeline())
                 st.rerun()
