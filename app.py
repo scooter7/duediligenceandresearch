@@ -10,7 +10,7 @@ st.set_page_config(page_title="Investment Intel 2026", layout="wide")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("InvestmentApp")
 
-# Initialize Session State variables at the very top
+# Initialize Session State variables
 for k in ["plan_id", "tasks", "research_text", "final_memo", "auth"]:
     if k not in st.session_state: st.session_state[k] = None
 
@@ -52,7 +52,6 @@ def parse_tasks(text):
 # --- STEP 1: PLANNING (Logic separated from Display) ---
 target = st.text_input("Target Analysis", placeholder="e.g., Pet cremation in Phoenix, AZ")
 
-# Action: The Button only triggers the API call
 if st.button("📋 Step 1: Generate Strategic Plan") and target:
     with st.spinner("Creating 2026 Research Plan..."):
         try:
@@ -65,12 +64,11 @@ if st.button("📋 Step 1: Generate Strategic Plan") and target:
             # Store results in session state so they persist across reruns
             st.session_state.plan_id = i.id
             st.session_state.tasks = parse_tasks(get_text(i.outputs))
-            logger.info("Plan stored in session state.")
-            st.rerun() # Force the app to rerun and find the new 'tasks' state
+            st.rerun() 
         except Exception as e:
             st.error(f"Planning Error: {e}")
 
-# Display: This renders ONLY if tasks exist, regardless of button state
+# DISPLAY: Rendered OUTSIDE of the button block to ensure persistence
 if st.session_state.tasks:
     st.divider()
     st.subheader("🔍 Investigation Phase")
@@ -83,7 +81,6 @@ if st.session_state.tasks:
     if st.button("🚀 Step 2: Start Deep Research"):
         with st.spinner("Agent searching the web (2-5 mins)..."):
             try:
-                # Triggers background investigation
                 i = client.interactions.create(
                     agent="deep-research-pro-preview-12-2025", 
                     input="Find founder emails/phones for:\n" + "\n".join(selected_tasks),
@@ -98,11 +95,11 @@ if st.session_state.tasks:
                     time.sleep(5)
                 
                 st.session_state.research_text = get_text(interaction.outputs)
-                st.rerun() # Refresh to show research results
+                st.rerun() 
             except Exception as e:
                 st.error(f"Research Error: {e}")
 
-# --- STEP 3: FINAL ANALYSIS ---
+# --- STEP 3: FINAL ANALYSIS (Using corrected .run() method) ---
 if st.session_state.research_text:
     st.divider()
     with st.expander("Peek at Raw Data"): 
@@ -111,7 +108,6 @@ if st.session_state.research_text:
     if st.button("📊 Step 3: Run Analysis Pipeline"):
         with st.spinner("Synthesizing final report..."):
             try:
-                # ADK Agents for specialized logic
                 fin = LlmAgent(name="Fin", model="gemini-3-pro-preview", 
                                instruction=f"Build model from: {st.session_state.research_text}", 
                                tools=[generate_financial_chart])
@@ -119,14 +115,15 @@ if st.session_state.research_text:
                                    instruction="Write memo with founder contact table.", 
                                    tools=[generate_html_report])
                 
-                # Initiate ADK pipeline
+                # ADK SequentialAgent uses .run()
                 pipeline = SequentialAgent(name="AnalysisPipeline", sub_agents=[fin, partner])
-                result = pipeline.initiate(input="Complete Investment Memo")
+                result = pipeline.run(input="Complete Investment Memo")
                 
-                st.session_state.final_memo = result.output if hasattr(result, 'output') else str(result)
+                # Capture result
+                st.session_state.final_memo = result if isinstance(result, str) else getattr(result, 'output', str(result))
                 st.rerun()
             except Exception as e:
-                st.error(f"Analysis Error: {e}")
+                st.error(f"Analysis Error: {str(e)}")
 
 # Final Report Display
 if st.session_state.final_memo:
