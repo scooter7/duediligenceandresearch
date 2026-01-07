@@ -1,5 +1,4 @@
 import streamlit as st
-import asyncio
 import time
 import re
 import logging
@@ -27,6 +26,7 @@ DEFAULT_STATE = {
     "step2_status": None,
     "step3_status": None,
     "artifacts": [],
+    "debug_mode": False,
 }
 
 for key, default_value in DEFAULT_STATE.items():
@@ -50,10 +50,12 @@ with st.sidebar:
     st.header("⚙️ Settings")
     api_key = st.secrets.get("GOOGLE_API_KEY") or st.text_input("Gemini API Key", type="password")
     
+    st.session_state.debug_mode = st.checkbox("🐛 Debug Mode", value=False)
+    
     st.divider()
     if st.button("🔄 Reset Everything", type="secondary"):
         for key in list(st.session_state.keys()):
-            if key != "auth":
+            if key not in ["auth", "debug_mode"]:
                 del st.session_state[key]
         st.rerun()
     
@@ -71,26 +73,50 @@ st.title("📈 Strategic Investment & Research Platform")
 
 if not api_key:
     st.warning("⚠️ Please enter your Gemini API Key in the sidebar to continue.")
+    st.info("You can get a free API key at: https://aistudio.google.com/app/apikey")
     st.stop()
 
 # Make API key available to environment
 os.environ["GOOGLE_API_KEY"] = api_key
-client = genai.Client(api_key=api_key)
+
+# Test API key validity
+try:
+    client = genai.Client(api_key=api_key)
+    # Quick test call
+    if st.session_state.debug_mode:
+        st.sidebar.success("✅ API Key Valid")
+except Exception as e:
+    st.error(f"❌ Invalid API Key: {str(e)}")
+    st.stop()
 
 # --- HELPER FUNCTIONS ---
 
 def parse_tasks(text: str) -> List[Dict[str, str]]:
     """Extract numbered tasks from text."""
+    if not text:
+        return []
+    
     tasks = []
-    for match in re.finditer(
-        r"^(\d+)[\.\)\-]\s*(.+?)(?=\n\d+[\.\)\-]|\n\n|\Z)",
-        text,
-        re.MULTILINE | re.DOTALL,
-    ):
-        tasks.append({
-            "num": match.group(1),
-            "text": match.group(2).strip()
-        })
+    # Try multiple patterns
+    patterns = [
+        r"^(\d+)[\.\)]\s*(.+?)(?=\n\d+[\.\)]|\Z)",  # 1. or 1)
+        r"^(\d+)[\.\)\-:]\s*(.+?)(?=\n\d+[\.\)\-:]|\Z)",  # 1. 1) 1- 1:
+        r"^\*\*(\d+)[\.\)]\*\*\s*(.+?)(?=\n\*\*\d+|\Z)",  # **1.** bold
+    ]
+    
+    for pattern in patterns:
+        matches = list(re.finditer(pattern, text, re.MULTILINE | re.DOTALL))
+        if matches:
+            for match in matches:
+                task_text = match.group(2).strip()
+                # Clean up markdown and extra whitespace
+                task_text = re.sub(r'\*\*|\*|#+', '', task_text).strip()
+                tasks.append({
+                    "num": match.group(1),
+                    "text": task_text[:200]  # Limit length
+                })
+            break
+    
     return tasks
 
 
@@ -99,34 +125,37 @@ def extract_text_from_response(response) -> str:
     if response is None:
         return ""
     
-    # Try direct text attribute
-    if hasattr(response, 'text') and response.text:
-        return response.text.strip()
-    
-    # Try candidates structure
-    if hasattr(response, 'candidates') and response.candidates:
-        for candidate in response.candidates:
-            if hasattr(candidate, 'content') and candidate.content:
-                content = candidate.content
-                if hasattr(content, 'parts') and content.parts:
-                    text_parts = []
-                    for part in content.parts:
-                        if hasattr(part, 'text') and part.text:
-                            text_parts.append(part.text)
-                    if text_parts:
-                        return "\n".join(text_parts).strip()
-    
-    # Fallback to string representation
-    return str(response).strip()
-
-
-def safe_api_call(func, *args, **kwargs):
-    """Wrapper for API calls with error handling."""
     try:
-        return func(*args, **kwargs), None
+        # Method 1: Direct text attribute
+        if hasattr(response, 'text') and response.text:
+            return response.text.strip()
+        
+        # Method 2: candidates structure
+        if hasattr(response, 'candidates') and response.candidates:
+            for candidate in response.candidates:
+                if hasattr(candidate, 'content') and candidate.content:
+                    content = candidate.content
+                    if hasattr(content, 'parts') and content.parts:
+                        text_parts = []
+                        for part in content.parts:
+                            if hasattr(part, 'text') and part.text:
+                                text_parts.append(part.text)
+                        if text_parts:
+                            return "\n".join(text_parts).strip()
+        
+        # Method 3: Direct parts
+        if hasattr(response, 'parts') and response.parts:
+            text_parts = []
+            for part in response.parts:
+                if hasattr(part, 'text') and part.text:
+                    text_parts.append(part.text)
+            if text_parts:
+                return "\n".join(text_parts).strip()
+        
     except Exception as e:
-        logger.error(f"API call failed: {str(e)}", exc_info=True)
-        return None, str(e)
+        logger.error(f"Error extracting text: {e}")
+    
+    return ""
 
 
 # --- STEP 1: PLANNING ---
@@ -155,24 +184,73 @@ Break down the research into 5-7 specific, actionable tasks. Include:
 - Financial analysis
 - Contact information discovery (founders, key executives)
 
-Format as a numbered list."""
+Format as a simple numbered list like this:
+1. Task description here
+2. Another task description
+3. Third task
 
-        response, error = safe_api_call(
-            client.models.generate_content,
-            model="gemini-2.0-flash-exp",
-            contents=prompt
-        )
-        
-        if error:
-            st.error(f"❌ Planning failed: {error}")
-        elif response:
+Keep each task clear and concise."""
+
+        try:
+            if st.session_state.debug_mode:
+                st.info(f"🔍 Calling API with model: gemini-2.0-flash-exp")
+                st.code(prompt[:200] + "...")
+            
+            # Make the API call
+            response = client.models.generate_content(
+                model="gemini-2.0-flash-exp",
+                contents=prompt
+            )
+            
+            if st.session_state.debug_mode:
+                st.success("✅ API call completed")
+                st.write("Response type:", type(response))
+                st.write("Has text attr:", hasattr(response, 'text'))
+                st.write("Has candidates:", hasattr(response, 'candidates'))
+            
+            # Extract text
             text = extract_text_from_response(response)
-            st.session_state.tasks = parse_tasks(text)
-            st.session_state.plan_id = f"plan_{int(time.time())}"
-            st.session_state.research_text = None  # Reset downstream
-            st.session_state.final_memo = None
-            st.success("✅ Plan generated successfully!")
-            st.rerun()
+            
+            if st.session_state.debug_mode:
+                st.write(f"📝 Extracted text length: {len(text)}")
+                with st.expander("Raw Response Text"):
+                    st.code(text[:500] if text else "NO TEXT EXTRACTED")
+            
+            if not text:
+                st.error("❌ No text returned from API. Check your API key and quota.")
+                if st.session_state.debug_mode:
+                    st.json({"response_str": str(response)[:500]})
+            else:
+                # Parse tasks
+                tasks = parse_tasks(text)
+                
+                if st.session_state.debug_mode:
+                    st.write(f"📊 Parsed {len(tasks)} tasks")
+                
+                if not tasks:
+                    # Fallback: split by lines
+                    st.warning("⚠️ Using fallback task parsing")
+                    lines = [l.strip() for l in text.split('\n') if l.strip()]
+                    tasks = [{"num": str(i+1), "text": line} for i, line in enumerate(lines[:7])]
+                
+                if tasks:
+                    st.session_state.tasks = tasks
+                    st.session_state.plan_id = f"plan_{int(time.time())}"
+                    st.session_state.research_text = None  # Reset downstream
+                    st.session_state.final_memo = None
+                    st.success(f"✅ Plan generated with {len(tasks)} tasks!")
+                    st.rerun()
+                else:
+                    st.error("❌ Could not parse tasks from response")
+                    with st.expander("Show raw response"):
+                        st.text(text)
+            
+        except Exception as e:
+            st.error(f"❌ Planning failed: {str(e)}")
+            logger.error(f"Planning error: {str(e)}", exc_info=True)
+            
+            if st.session_state.debug_mode:
+                st.exception(e)
 
 # Display generated plan
 if st.session_state.tasks:
@@ -204,7 +282,7 @@ if st.session_state.tasks:
     st.write(f"**Selected: {len(selected_tasks)} of {len(st.session_state.tasks)} tasks**")
     
     if st.button("🚀 Start Research", type="primary", disabled=len(selected_tasks) == 0):
-        with st.spinner("🔬 Running deep research (this may take 2-5 minutes)..."):
+        with st.spinner("🔬 Running deep research (this may take 1-3 minutes)..."):
             
             # Create comprehensive research prompt
             research_prompt = f"""Conduct thorough research on: {target}
@@ -220,33 +298,37 @@ For each task, provide:
 Structure your response clearly with headers for each task."""
 
             try:
-                # Use direct generate_content for more stability
-                response, error = safe_api_call(
-                    client.models.generate_content,
+                if st.session_state.debug_mode:
+                    st.info("🔍 Starting research API call...")
+                
+                response = client.models.generate_content(
                     model="gemini-2.0-flash-exp",
                     contents=research_prompt
                 )
                 
-                if error:
-                    st.error(f"❌ Research failed: {error}")
-                    st.session_state.step2_status = "error"
-                elif response:
-                    text = extract_text_from_response(response)
-                    
-                    if text and len(text) > 100:
-                        st.session_state.research_text = text
-                        st.session_state.step2_status = "complete"
-                        st.session_state.final_memo = None  # Reset downstream
-                        st.success("✅ Research completed successfully!")
-                        st.rerun()
-                    else:
-                        st.warning("⚠️ Research returned minimal results. Try adjusting your tasks.")
-                        st.session_state.step2_status = "incomplete"
+                text = extract_text_from_response(response)
+                
+                if st.session_state.debug_mode:
+                    st.write(f"📝 Research text length: {len(text)}")
+                
+                if text and len(text) > 100:
+                    st.session_state.research_text = text
+                    st.session_state.step2_status = "complete"
+                    st.session_state.final_memo = None  # Reset downstream
+                    st.success("✅ Research completed successfully!")
+                    st.rerun()
+                else:
+                    st.warning("⚠️ Research returned minimal results. Try adjusting your tasks.")
+                    st.session_state.step2_status = "incomplete"
+                    if st.session_state.debug_mode:
+                        st.text(text)
                         
             except Exception as e:
-                st.error(f"❌ Unexpected error: {str(e)}")
+                st.error(f"❌ Research failed: {str(e)}")
                 st.session_state.step2_status = "error"
                 logger.error(f"Research error: {str(e)}", exc_info=True)
+                if st.session_state.debug_mode:
+                    st.exception(e)
 
 # Display research results
 if st.session_state.research_text:
@@ -323,62 +405,58 @@ Your memo should include:
 Format professionally with clear sections and markdown formatting."""
             
             try:
-                response, error = safe_api_call(
-                    client.models.generate_content,
+                response = client.models.generate_content(
                     model="gemini-2.0-flash-exp",
                     contents=analysis_prompt
                 )
                 
-                if error:
-                    st.error(f"❌ Analysis failed: {error}")
-                    st.session_state.step3_status = "error"
-                elif response:
-                    memo_text = extract_text_from_response(response)
-                    
-                    if memo_text and len(memo_text) > 100:
-                        # If HTML requested, convert
-                        if format_html:
-                            html_prompt = f"""Convert this investment memo to professional HTML with CSS styling:
+                memo_text = extract_text_from_response(response)
+                
+                if memo_text and len(memo_text) > 100:
+                    # If HTML requested, convert
+                    if format_html:
+                        html_prompt = f"""Convert this investment memo to professional HTML with CSS styling:
 
 {memo_text}
 
 Use clean, modern styling with proper headers, tables, and formatting. Include inline CSS."""
-                            
-                            html_response, html_error = safe_api_call(
-                                client.models.generate_content,
+                        
+                        try:
+                            html_response = client.models.generate_content(
                                 model="gemini-2.0-flash-exp",
                                 contents=html_prompt
                             )
                             
-                            if html_response and not html_error:
-                                html_text = extract_text_from_response(html_response)
-                                # Clean up markdown code blocks if present
-                                html_text = html_text.replace("```html", "").replace("```", "").strip()
-                                
-                                # Save HTML file
-                                html_file = Path("outputs") / f"memo_{int(time.time())}.html"
-                                html_file.write_text(html_text, encoding="utf-8")
-                                st.session_state.artifacts.append(str(html_file))
-                                
-                                st.session_state.final_memo = memo_text
-                                st.success(f"✅ HTML report saved to: {html_file}")
-                            else:
-                                st.warning("⚠️ HTML conversion failed, showing markdown version")
-                                st.session_state.final_memo = memo_text
-                        else:
+                            html_text = extract_text_from_response(html_response)
+                            # Clean up markdown code blocks if present
+                            html_text = html_text.replace("```html", "").replace("```", "").strip()
+                            
+                            # Save HTML file
+                            html_file = Path("outputs") / f"memo_{int(time.time())}.html"
+                            html_file.write_text(html_text, encoding="utf-8")
+                            st.session_state.artifacts.append(str(html_file))
+                            
                             st.session_state.final_memo = memo_text
-                        
-                        st.session_state.step3_status = "complete"
-                        st.success("✅ Investment memo generated successfully!")
-                        st.rerun()
+                            st.success(f"✅ HTML report saved to: {html_file}")
+                        except Exception as html_error:
+                            st.warning(f"⚠️ HTML conversion failed: {html_error}, showing markdown version")
+                            st.session_state.final_memo = memo_text
                     else:
-                        st.warning("⚠️ Analysis returned minimal results.")
-                        st.session_state.step3_status = "incomplete"
-                        
+                        st.session_state.final_memo = memo_text
+                    
+                    st.session_state.step3_status = "complete"
+                    st.success("✅ Investment memo generated successfully!")
+                    st.rerun()
+                else:
+                    st.warning("⚠️ Analysis returned minimal results.")
+                    st.session_state.step3_status = "incomplete"
+                    
             except Exception as e:
-                st.error(f"❌ Unexpected error: {str(e)}")
+                st.error(f"❌ Analysis failed: {str(e)}")
                 st.session_state.step3_status = "error"
                 logger.error(f"Analysis error: {str(e)}", exc_info=True)
+                if st.session_state.debug_mode:
+                    st.exception(e)
 
 # Display final memo
 if st.session_state.final_memo:
