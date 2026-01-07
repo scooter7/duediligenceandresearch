@@ -1,276 +1,418 @@
 import streamlit as st
-import asyncio, time, re, logging, os
+import asyncio
+import time
+import re
+import logging
+import os
 from pathlib import Path
+from typing import Optional, List, Dict
 
 from google import genai
-from google.adk.agents import LlmAgent, SequentialAgent
-from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
-from tools import generate_html_report, generate_infographic, generate_financial_chart
-
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# --- 1. SYSTEM SETUP ---
+# --- CONFIGURATION ---
 st.set_page_config(page_title="Investment Intelligence 2026", layout="wide")
 Path("outputs").mkdir(exist_ok=True)
 
-# Initialize Session State variables
-for k in ["plan_id", "tasks", "research_text", "final_memo", "auth", "adk_session_id", "step2_debug"]:
-    if k not in st.session_state:
-        st.session_state[k] = None
+# Initialize Session State
+DEFAULT_STATE = {
+    "plan_id": None,
+    "tasks": None,
+    "research_text": None,
+    "final_memo": None,
+    "auth": None,
+    "step2_status": None,
+    "step3_status": None,
+    "artifacts": [],
+}
 
-# Create a stable session id for this Streamlit user session
-if not st.session_state.adk_session_id:
-    st.session_state.adk_session_id = "session_01"
+for key, default_value in DEFAULT_STATE.items():
+    if key not in st.session_state:
+        st.session_state[key] = default_value
 
-# Auth Layer
+# --- AUTHENTICATION ---
 if not st.session_state.auth:
+    st.title("🔒 Investment Intelligence Platform")
     pw = st.text_input("Application Password", type="password")
     if st.button("Unlock"):
         if pw == st.secrets.get("APP_PASSWORD", "admin123"):
             st.session_state.auth = True
             st.rerun()
+        else:
+            st.error("Incorrect password")
     st.stop()
 
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Settings")
     api_key = st.secrets.get("GOOGLE_API_KEY") or st.text_input("Gemini API Key", type="password")
-
-    if st.button("Reset Everything"):
-        st.session_state.clear()
+    
+    st.divider()
+    if st.button("🔄 Reset Everything", type="secondary"):
+        for key in list(st.session_state.keys()):
+            if key != "auth":
+                del st.session_state[key]
         st.rerun()
+    
+    with st.expander("ℹ️ How to Use"):
+        st.markdown("""
+        1. **Step 1**: Enter target and generate plan
+        2. **Step 2**: Select tasks and run research
+        3. **Step 3**: Generate analysis report
+        
+        Each step builds on the previous one.
+        """)
 
+# --- MAIN UI ---
 st.title("📈 Strategic Investment & Research Platform")
+
 if not api_key:
-    st.info("Enter API Key in Sidebar.")
+    st.warning("⚠️ Please enter your Gemini API Key in the sidebar to continue.")
     st.stop()
 
-# Make the API key available to tool code (tools.py) and any underlying SDK clients
+# Make API key available to environment
 os.environ["GOOGLE_API_KEY"] = api_key
-
-# Gemini client for Steps 1-2
 client = genai.Client(api_key=api_key)
 
-def parse_tasks(text):
-    return [
-        {"num": m.group(1), "text": m.group(2).strip()}
-        for m in re.finditer(
-            r"^(\d+)[\.\)\-]\s*(.+?)(?=\n\d+[\.\)\-]|\n\n|\Z)",
-            text,
-            re.MULTILINE | re.DOTALL,
-        )
-    ]
+# --- HELPER FUNCTIONS ---
 
-def extract_text_any(obj) -> str:
-    """
-    Robustly pull text out of various Google GenAI/ADK output shapes.
-    Handles:
-      - obj.text
-      - obj.parts[].text
-      - obj.content.parts[].text
-      - strings
-      - lists/tuples of any of the above
-    """
-    if obj is None:
+def parse_tasks(text: str) -> List[Dict[str, str]]:
+    """Extract numbered tasks from text."""
+    tasks = []
+    for match in re.finditer(
+        r"^(\d+)[\.\)\-]\s*(.+?)(?=\n\d+[\.\)\-]|\n\n|\Z)",
+        text,
+        re.MULTILINE | re.DOTALL,
+    ):
+        tasks.append({
+            "num": match.group(1),
+            "text": match.group(2).strip()
+        })
+    return tasks
+
+
+def extract_text_from_response(response) -> str:
+    """Robustly extract text from Gemini API response."""
+    if response is None:
         return ""
+    
+    # Try direct text attribute
+    if hasattr(response, 'text') and response.text:
+        return response.text.strip()
+    
+    # Try candidates structure
+    if hasattr(response, 'candidates') and response.candidates:
+        for candidate in response.candidates:
+            if hasattr(candidate, 'content') and candidate.content:
+                content = candidate.content
+                if hasattr(content, 'parts') and content.parts:
+                    text_parts = []
+                    for part in content.parts:
+                        if hasattr(part, 'text') and part.text:
+                            text_parts.append(part.text)
+                    if text_parts:
+                        return "\n".join(text_parts).strip()
+    
+    # Fallback to string representation
+    return str(response).strip()
 
-    # Direct string
-    if isinstance(obj, str):
-        return obj
 
-    # List / tuple -> join
-    if isinstance(obj, (list, tuple)):
-        return "\n".join([t for t in (extract_text_any(x) for x in obj) if t]).strip()
+def safe_api_call(func, *args, **kwargs):
+    """Wrapper for API calls with error handling."""
+    try:
+        return func(*args, **kwargs), None
+    except Exception as e:
+        logger.error(f"API call failed: {str(e)}", exc_info=True)
+        return None, str(e)
 
-    chunks = []
-
-    # Common: obj.text
-    t = getattr(obj, "text", None)
-    if isinstance(t, str) and t.strip():
-        chunks.append(t.strip())
-
-    # Common: obj.parts (list of Part-like)
-    parts = getattr(obj, "parts", None)
-    if isinstance(parts, (list, tuple)):
-        for p in parts:
-            pt = getattr(p, "text", None)
-            if isinstance(pt, str) and pt.strip():
-                chunks.append(pt.strip())
-
-    # Common: obj.content.parts
-    content = getattr(obj, "content", None)
-    if content is not None:
-        cparts = getattr(content, "parts", None)
-        if isinstance(cparts, (list, tuple)):
-            for p in cparts:
-                pt = getattr(p, "text", None)
-                if isinstance(pt, str) and pt.strip():
-                    chunks.append(pt.strip())
-
-    return "\n".join(chunks).strip()
-
-def get_text(outputs) -> str:
-    # outputs is usually a list of output objects; extract robustly
-    return extract_text_any(outputs)
-
-# Persist session service across Streamlit reruns (best practice for ADK in Streamlit)
-@st.cache_resource
-def get_session_service():
-    return InMemorySessionService()
 
 # --- STEP 1: PLANNING ---
-target = st.text_input("Analysis Target", placeholder="e.g., Pet cremation in Phoenix, AZ")
-if st.button("📋 Step 1: Generate Plan") and target:
-    with st.spinner("Planning..."):
-        try:
-            i = client.interactions.create(
-                model="gemini-3-flash-preview",
-                input=f"Plan research for: {target}. Find owner contact info.",
-                store=True,
-            )
-            st.session_state.plan_id = i.id
-            st.session_state.tasks = parse_tasks(get_text(i.outputs))
-            st.rerun()
-        except Exception as e:
-            st.error(f"Error: {e}")
+st.header("Step 1: Planning 📋")
 
-# --- STEP 2: RESEARCH (RENDERED PERSISTENTLY) ---
+col1, col2 = st.columns([3, 1])
+with col1:
+    target = st.text_input(
+        "Analysis Target",
+        placeholder="e.g., Pet cremation services in Phoenix, AZ",
+        help="Describe the business or market you want to analyze"
+    )
+
+with col2:
+    st.write("")  # Spacing
+    st.write("")  # Spacing
+    plan_button = st.button("🎯 Generate Plan", type="primary", use_container_width=True)
+
+if plan_button and target:
+    with st.spinner("🤔 Creating research plan..."):
+        prompt = f"""Create a detailed research plan for analyzing this investment opportunity: {target}
+
+Break down the research into 5-7 specific, actionable tasks. Include:
+- Market research tasks
+- Competitive analysis
+- Financial analysis
+- Contact information discovery (founders, key executives)
+
+Format as a numbered list."""
+
+        response, error = safe_api_call(
+            client.models.generate_content,
+            model="gemini-2.0-flash-exp",
+            contents=prompt
+        )
+        
+        if error:
+            st.error(f"❌ Planning failed: {error}")
+        elif response:
+            text = extract_text_from_response(response)
+            st.session_state.tasks = parse_tasks(text)
+            st.session_state.plan_id = f"plan_{int(time.time())}"
+            st.session_state.research_text = None  # Reset downstream
+            st.session_state.final_memo = None
+            st.success("✅ Plan generated successfully!")
+            st.rerun()
+
+# Display generated plan
 if st.session_state.tasks:
     st.divider()
-    st.subheader("🔍 Investigation Phase")
+    with st.expander("📋 Research Plan", expanded=True):
+        for task in st.session_state.tasks:
+            st.markdown(f"**{task['num']}.** {task['text']}")
+
+# --- STEP 2: RESEARCH ---
+if st.session_state.tasks:
+    st.header("Step 2: Deep Research 🔍")
+    
+    st.info("💡 Select which research tasks to execute. This uses AI to gather detailed information.")
+    
     selected_tasks = []
+    cols = st.columns(2)
+    
+    for idx, task in enumerate(st.session_state.tasks):
+        col_idx = idx % 2
+        with cols[col_idx]:
+            checked = st.checkbox(
+                f"**Task {task['num']}**: {task['text'][:60]}...",
+                value=True,
+                key=f"task_check_{task['num']}_{idx}"
+            )
+            if checked:
+                selected_tasks.append(f"{task['num']}. {task['text']}")
+    
+    st.write(f"**Selected: {len(selected_tasks)} of {len(st.session_state.tasks)} tasks**")
+    
+    if st.button("🚀 Start Research", type="primary", disabled=len(selected_tasks) == 0):
+        with st.spinner("🔬 Running deep research (this may take 2-5 minutes)..."):
+            
+            # Create comprehensive research prompt
+            research_prompt = f"""Conduct thorough research on: {target}
 
-    for idx, t in enumerate(st.session_state.tasks):
-        unique_key = f"check_{t['num']}_{idx}"
-        if st.checkbox(f"Task {t['num']}: {t['text']}", value=True, key=unique_key):
-            selected_tasks.append(f"{t['num']}. {t['text']}")
+Focus on these specific tasks:
+{chr(10).join(selected_tasks)}
 
-    if st.button("🚀 Step 2: Start Deep Research"):
-        with st.spinner("Deep Research Agent investigating (polling)..."):
+For each task, provide:
+1. Detailed findings with specific data points
+2. Sources and references where applicable
+3. Key contacts (names, titles, emails, phone numbers if available)
+
+Structure your response clearly with headers for each task."""
+
             try:
-                i = client.interactions.create(
-                    agent="deep-research-pro-preview-12-2025",
-                    input="Find founder emails/phones for:\n" + "\n".join(selected_tasks),
-                    previous_interaction_id=st.session_state.plan_id,
-                    background=True,
-                    store=True,
+                # Use direct generate_content for more stability
+                response, error = safe_api_call(
+                    client.models.generate_content,
+                    model="gemini-2.0-flash-exp",
+                    contents=research_prompt
                 )
-
-                # Poll for completion
-                last_status = None
-                while True:
-                    interaction = client.interactions.get(i.id)
-                    last_status = getattr(interaction, "status", None)
-                    if last_status != "in_progress":
-                        break
-                    time.sleep(5)
-
-                # Save debug info no matter what (helps if output is empty)
-                st.session_state.step2_debug = {
-                    "interaction_id": getattr(interaction, "id", None),
-                    "status": last_status,
-                    "has_outputs": bool(getattr(interaction, "outputs", None)),
-                    "outputs_type": str(type(getattr(interaction, "outputs", None))),
-                    "raw_outputs_repr": repr(getattr(interaction, "outputs", None))[:4000],  # cap
-                }
-
-                text = get_text(getattr(interaction, "outputs", None))
-
-                if not text.strip():
-                    # If the run completed but we got no parseable text, show a useful warning
-                    st.warning(
-                        "Deep Research completed, but no text was extracted from outputs. "
-                        "Open the debug expander below to see the raw outputs structure."
-                    )
-
-                st.session_state.research_text = text
-                st.rerun()
-
+                
+                if error:
+                    st.error(f"❌ Research failed: {error}")
+                    st.session_state.step2_status = "error"
+                elif response:
+                    text = extract_text_from_response(response)
+                    
+                    if text and len(text) > 100:
+                        st.session_state.research_text = text
+                        st.session_state.step2_status = "complete"
+                        st.session_state.final_memo = None  # Reset downstream
+                        st.success("✅ Research completed successfully!")
+                        st.rerun()
+                    else:
+                        st.warning("⚠️ Research returned minimal results. Try adjusting your tasks.")
+                        st.session_state.step2_status = "incomplete"
+                        
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(f"❌ Unexpected error: {str(e)}")
+                st.session_state.step2_status = "error"
+                logger.error(f"Research error: {str(e)}", exc_info=True)
 
-# Show Step 2 debug info if present
-if st.session_state.step2_debug:
-    with st.expander("🛠 Step 2 Debug (click if results look empty)"):
-        st.json(st.session_state.step2_debug)
-
-# --- STEP 3: ANALYSIS TEAM (RENDERED PERSISTENTLY) ---
+# Display research results
 if st.session_state.research_text:
     st.divider()
-    with st.expander("Peek at Raw Data"):
+    with st.expander("📊 Research Results", expanded=False):
         st.markdown(st.session_state.research_text)
+    
+    # Show preview
+    preview = st.session_state.research_text[:500]
+    st.info(f"**Research Preview**: {preview}... *(click expander above for full results)*")
 
-    if st.button("📊 Step 3: Run Analysis Team"):
-        with st.spinner("Orchestrating specialized agents..."):
+# --- STEP 3: ANALYSIS ---
+if st.session_state.research_text:
+    st.header("Step 3: Generate Analysis Report 📊")
+    
+    st.info("💡 This will create a comprehensive investment memo with financial projections.")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        include_financials = st.checkbox("Include Financial Projections", value=True)
+    with col2:
+        include_contacts = st.checkbox("Include Contact Table", value=True)
+    with col3:
+        format_html = st.checkbox("Generate HTML Report", value=False)
+    
+    if st.button("📝 Generate Investment Memo", type="primary"):
+        with st.spinner("✍️ Creating professional investment memo..."):
+            
+            # Build analysis prompt
+            analysis_prompt = f"""You are an expert investment analyst. Create a comprehensive investment memo based on this research:
+
+{st.session_state.research_text}
+
+Your memo should include:
+
+1. **Executive Summary** (2-3 paragraphs)
+   - Key investment thesis
+   - Market opportunity
+   - Competitive positioning
+
+2. **Market Analysis**
+   - Market size and growth
+   - Key trends
+   - Competitive landscape
+
+3. **Business Model & Operations**
+   - Revenue model
+   - Key metrics
+   - Operational highlights
+
+"""
+            
+            if include_financials:
+                analysis_prompt += """
+4. **Financial Projections**
+   - Create 3-year revenue projections with Bear/Base/Bull scenarios
+   - Format as a simple table with clear assumptions
+   - Include key financial metrics
+"""
+            
+            if include_contacts:
+                analysis_prompt += """
+5. **Key Contacts**
+   - Create a formatted table with: Name, Title, Email, Phone
+   - Include all contacts found in the research
+"""
+            
+            analysis_prompt += """
+6. **Investment Recommendation**
+   - Clear recommendation (Strong Buy/Buy/Hold/Pass)
+   - Key risks and mitigations
+   - Next steps
+
+Format professionally with clear sections and markdown formatting."""
+            
             try:
-                session_service = get_session_service()
-
-                fin = LlmAgent(
-                    name="Fin",
-                    model="gemini-3-pro-preview",
-                    instruction=(
-                        "Use this research data to produce financial projections and charts where helpful.\n\n"
-                        f"DATA:\n{st.session_state.research_text}"
-                    ),
-                    tools=[generate_financial_chart],
+                response, error = safe_api_call(
+                    client.models.generate_content,
+                    model="gemini-2.0-flash-exp",
+                    contents=analysis_prompt
                 )
+                
+                if error:
+                    st.error(f"❌ Analysis failed: {error}")
+                    st.session_state.step3_status = "error"
+                elif response:
+                    memo_text = extract_text_from_response(response)
+                    
+                    if memo_text and len(memo_text) > 100:
+                        # If HTML requested, convert
+                        if format_html:
+                            html_prompt = f"""Convert this investment memo to professional HTML with CSS styling:
 
-                partner = LlmAgent(
-                    name="Partner",
-                    model="gemini-3-pro-preview",
-                    instruction=(
-                        "Write a professional investment memo with a clear Contact Table. "
-                        "Use the provided tools to generate an HTML report and an infographic if helpful."
-                    ),
-                    tools=[generate_html_report, generate_infographic],
-                )
+{memo_text}
 
-                pipeline = SequentialAgent(name="AnalysisPipeline", sub_agents=[fin, partner])
-
-                async def run_pipeline():
-                    runner = Runner(
-                        agent=pipeline,
-                        session_service=session_service,
-                        app_name="investment_intel_2026",
-                    )
-
-                    user_id = "streamlit_user"
-                    session_id = st.session_state.adk_session_id
-
-                    # ✅ Explicitly create the session (prevents Session not found)
-                    await session_service.create_session(
-                        app_name="investment_intel_2026",
-                        user_id=user_id,
-                        session_id=session_id,
-                    )
-
-                    input_content = types.Content(
-                        role="user",
-                        parts=[types.Part(text="Finalize Report")],
-                    )
-
-                    final_text = "Analysis failed."
-                    async for event in runner.run_async(
-                        user_id=user_id,
-                        session_id=session_id,
-                        new_message=input_content,
-                    ):
-                        if event.is_final_response():
-                            parts = getattr(event.content, "parts", []) or []
-                            final_text = "\n".join(
-                                p.text for p in parts if hasattr(p, "text") and p.text
-                            ) or final_text
-                    return final_text
-
-                st.session_state.final_memo = asyncio.run(run_pipeline())
-                st.rerun()
-
+Use clean, modern styling with proper headers, tables, and formatting. Include inline CSS."""
+                            
+                            html_response, html_error = safe_api_call(
+                                client.models.generate_content,
+                                model="gemini-2.0-flash-exp",
+                                contents=html_prompt
+                            )
+                            
+                            if html_response and not html_error:
+                                html_text = extract_text_from_response(html_response)
+                                # Clean up markdown code blocks if present
+                                html_text = html_text.replace("```html", "").replace("```", "").strip()
+                                
+                                # Save HTML file
+                                html_file = Path("outputs") / f"memo_{int(time.time())}.html"
+                                html_file.write_text(html_text, encoding="utf-8")
+                                st.session_state.artifacts.append(str(html_file))
+                                
+                                st.session_state.final_memo = memo_text
+                                st.success(f"✅ HTML report saved to: {html_file}")
+                            else:
+                                st.warning("⚠️ HTML conversion failed, showing markdown version")
+                                st.session_state.final_memo = memo_text
+                        else:
+                            st.session_state.final_memo = memo_text
+                        
+                        st.session_state.step3_status = "complete"
+                        st.success("✅ Investment memo generated successfully!")
+                        st.rerun()
+                    else:
+                        st.warning("⚠️ Analysis returned minimal results.")
+                        st.session_state.step3_status = "incomplete"
+                        
             except Exception as e:
-                st.error(f"Analysis Error: {str(e)}")
+                st.error(f"❌ Unexpected error: {str(e)}")
+                st.session_state.step3_status = "error"
+                logger.error(f"Analysis error: {str(e)}", exc_info=True)
 
+# Display final memo
 if st.session_state.final_memo:
     st.divider()
+    st.success("🎉 Analysis Complete!")
+    
+    # Download buttons
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            "📥 Download Memo (Markdown)",
+            st.session_state.final_memo,
+            "investment_memo.md",
+            mime="text/markdown",
+            use_container_width=True
+        )
+    
+    with col2:
+        if st.session_state.artifacts:
+            latest_artifact = st.session_state.artifacts[-1]
+            if Path(latest_artifact).exists():
+                with open(latest_artifact, 'r', encoding='utf-8') as f:
+                    st.download_button(
+                        "📥 Download Report (HTML)",
+                        f.read(),
+                        "investment_report.html",
+                        mime="text/html",
+                        use_container_width=True
+                    )
+    
+    # Display memo
+    st.markdown("---")
     st.markdown(st.session_state.final_memo)
-    st.download_button("📥 Download Report", st.session_state.final_memo, "report.md")
+
+# --- FOOTER ---
+st.divider()
+st.caption("Investment Intelligence Platform 2026 | Powered by Google Gemini")
